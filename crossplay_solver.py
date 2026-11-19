@@ -2,7 +2,7 @@
 """NYT Crossplay move finder.
 
 Usage: python3 crossplay_solver.py board.txt RACK [--top 15] [--defend N] [--cap N] [--no-swap]
-                                   [--last-move]
+                                   [--final N] [--last-move]
 
 board.txt: 15 lines of 15 chars. '.' = empty, UPPERCASE = tile, lowercase = blank tile.
 RACK: your letters, '?' for a blank. The NWL2023 word list is downloaded from GitHub if missing.
@@ -12,6 +12,12 @@ opponent's reply to the top N moves (exact once 7 or fewer tiles are unseen; oth
 up to --cap tiles, 4/5/7 by bag size, plus every 7-tile sweep, averaged over
 sampled racks) and ranks by equity = value - expected reply - turn cost. Turn cost: a move that leaves the bag non-empty is
 charged (chance they empty it) x (expected reply), since the bag-emptier gets the last turn.
+A move that empties the bag leaves me one final turn after their reply, so --defend works that
+turn out instead of pricing the leave: the unseen tiles are split into their rack and my draw (all
+splits, or --final N random ones), they make their top-scoring reply, and I make my top-scoring
+play. Its equity = score - expected reply + (my expected final play - typical turn), where the
+typical turn is the expected top play of a random unseen rack on the current board; taking that
+off keeps these moves on the same scale as the ones that are priced by leave value.
 Swaps (bag >= --swap-min) are 0-point moves valued at the leave kept.
 A sampled opponent rack that holds a blank may use it as any letter (scored 0), on the square where
 that costs least. --last-move: the bag is empty and this play ends the game (you emptied the bag and
@@ -150,11 +156,14 @@ def make_solve(S, cache_path=None):
     N, PREM, tile_score, SWEEP_BONUS, VALUES = S.N, S.PREM, S.tile_score, S.SWEEP_BONUS, S.VALUES
     LM, WM = S.LMUL, S.WMUL
 
-    def solve(board, rack, words, max_tiles=7, sink=None):
+    def solve(board, rack, words, max_tiles=7, sink=None, best=False):
         """Every legal move, best score first. A blank goes on the square where it costs least, and
         a one-tile play that forms a word both ways is listed once.
         With `sink`, no list is built: each move goes to sink(score, real, blanks, ref), where real
-        is [(letter, points that tile adds to the score)] for the non-blank tiles (see reply_model)."""
+        is [(letter, points that tile adds to the score)] for the non-blank tiles (see reply_model).
+        With `best`, a move is listed only if it scores at least as much as every move before it,
+        so the list still starts with every top-scoring move and most of the rest is skipped (see
+        final_play)."""
         allwords = getattr(words, "allwords", words)
         trie = get_trie(allwords, cache_path or TRIE_CACHE)
         rack_up = rack.upper()
@@ -165,6 +174,7 @@ def make_solve(S, cache_path=None):
         rc0 = Counter(rc)  # untouched copy: the search below mutates rc
         empty_board = all(ch == "." for row in board for ch in row)
         moves = []
+        top = [-1]  # best score so far, for `best`
         singles = set()  # one-tile plays already recorded: (square, letter)
 
         for horiz in (True, False):
@@ -242,6 +252,10 @@ def make_solve(S, cache_path=None):
                         sink(total, [(placed[i][1], adds[i]) for i in range(k) if i not in blank_at],
                              len(blank_at), (horiz, r, start, end, tuple(placed)))
                         return
+                    if best:
+                        if total < top[0]:
+                            return
+                        top[0] = total
                     tiles = [(c, ch.lower() if i in blank_at else ch)
                              for i, (c, ch) in enumerate(placed)]
                     newmap = dict(tiles)
@@ -689,6 +703,39 @@ def expected_threat(board, unseen, words, samples=3000, seed=1, cap=2, bag_after
             (example, sum(seen.values()) / samples, sweep_hits / samples))
 
 
+def final_play(board, leave, unseen, words, limit=80, seed=1):
+    """My last turn after a play that empties the bag. `board` has that play on it and `leave` is
+    what I kept. The unseen tiles split into the opponent's rack (7) and my draw (the rest). For
+    each split the opponent makes their top-scoring reply (of several that tie, the one that leaves
+    me least), then I make my top-scoring play with leave + draw on the board that results. Every
+    distinct split is tried, weighted by the number of ways it can be dealt, when there are at
+    most `limit` of them; otherwise `limit` random splits (the same ones for every candidate, so
+    the gap between two candidates is not noise).
+    Returns (my expected final score, their expected reply, exact?, racks tried)."""
+    import random
+    from itertools import combinations
+    tiles = sorted(unseen.elements())
+    ways = Counter(combinations(tiles, 7))
+    exact = len(ways) <= limit
+    if not exact:
+        rng = random.Random(seed)
+        ways = Counter(tuple(sorted(rng.sample(tiles, 7))) for _ in range(limit))
+    total = sum(ways.values())
+    mine = theirs = 0.0
+    for rack, n in ways.items():
+        reply = solve(board, "".join(rack), words, best=True)
+        hand = leave + "".join((unseen - Counter(rack)).elements())
+        lasts = []
+        for r in reply or [None]:
+            if r and r["score"] < reply[0]["score"]:
+                break
+            last = solve(apply_move(board, r) if r else board, hand, words, best=True)
+            lasts.append(last[0]["score"] if last else 0)
+        theirs += n * (reply[0]["score"] if reply else 0)
+        mine += n * min(lasts)
+    return round(mine / total, 1), round(theirs / total, 1), exact, len(ways) if exact else limit
+
+
 def swap_moves(rack, bag, best=3):
     """The `best` swaps by leave value of the tiles kept."""
     from itertools import combinations
@@ -738,6 +785,10 @@ def main():
     ap.add_argument("--cap", type=int, default=None,
                     help="most tiles in an opponent reply the defense check lists (default by "
                          "bag: 4 if over 40, 5 if 21-40, 7 = every reply if 20 or fewer)")
+    ap.add_argument("--final", type=int, default=80,
+                    help="with --defend, for a move that empties the bag: the most opponent racks "
+                         "tried when working out my own final play (default 80; every rack is "
+                         "tried if there are no more than that; 0 = price the leave instead)")
     ap.add_argument("--last-move", action="store_true",
                     help="the bag is empty and this play ends the game (you emptied the bag and the "
                          "opponent has had their final turn): rank by score alone, check no reply")
@@ -788,6 +839,12 @@ def main():
                   "ends the game, rerun with --last-move.")
         rows = []
         cache = None  # every swap leaves the board unchanged, so its reply is computed once
+        typical = None
+        if a.final > 0 and any(0 < bag <= len(m["tiles"]) for m in pool):
+            # what a turn is worth here: the expected top play of a random unseen rack
+            typical = expected_threat(board, unseen, words, samples=500, cap=a.cap)[0]
+            print("a move that empties the bag: its leave value is replaced by my expected final "
+                  f"play minus a typical turn ({typical:.1f})")
         for m in pool:
             b_after = max(0, bag - len(m["tiles"]))
             if "swap" in m and cache:
@@ -798,12 +855,20 @@ def main():
                 if "swap" in m:
                     cache = (exp, worst, p, exact, p_empty, sweep)
             cost = round(p_empty * exp, 1)
-            rows.append((m["val"] - exp - cost, exp, m, worst, p, exact, b_after, p_empty, cost,
-                         sweep))
+            val, fin = m["val"], None
+            if typical is not None and 0 < bag <= len(m["tiles"]):
+                mine, theirs, every, tried = final_play(apply_move(board, m), m["leave"], unseen,
+                                                        words, limit=a.final)
+                if every:
+                    exp = theirs  # every rack they can hold was tried, so this is not a sample
+                fin = (mine, round(mine - typical, 1), every, tried)
+                val = m["score"] + fin[1]
+            rows.append((val - exp - cost, exp, m, worst, p, exact, b_after, p_empty, cost,
+                         sweep, fin))
 
         def mv(x):
             return f"{x['word']} {x['score']} (row {x['row']} col {x['col']} {x['dir']})"
-        for eq, exp, m, worst, p, exact, b_after, p_empty, cost, sweep in sorted(
+        for eq, exp, m, worst, p, exact, b_after, p_empty, cost, sweep, fin in sorted(
                 rows, key=lambda x: -x[0]):
             if worst:
                 wt = mv(worst) + ("" if exact else f", they can play it {p:.0%} of the time")
@@ -811,6 +876,9 @@ def main():
                 wt = "none"
             if bag == 0:
                 turns = ""
+            elif fin:
+                turns = (f" | empties bag, my final play {fin[0]:.1f} "
+                         f"({'all' if fin[2] else 'sample of'} {fin[3]} opponent racks)")
             elif b_after == 0:
                 turns = " | empties bag"
             elif cost:
@@ -824,7 +892,7 @@ def main():
                 sw = (f" | 7-tile reply: {sa:.0%}, onto 2W/3W: {sp:.0%}"
                       + (f", e.g. {mv(sx)}" if sx else ""))
             print(f"equity {eq:6.1f}  {m['word']:<10} {m['score']:3d} {where(m)} "
-                  f"leave {m['leave'] or '-':<7} ({m['lv']:+.1f}) | "
+                  f"leave {m['leave'] or '-':<7} ({fin[1] if fin else m['lv']:+.1f}) | "
                   f"{'exact reply' if exact else 'expected reply'} {exp:.1f}{turns} | "
                   f"worst: {wt}{sw}")
 
