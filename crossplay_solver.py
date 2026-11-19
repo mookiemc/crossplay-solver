@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """NYT Crossplay move finder.
 
-Usage: python3 crossplay_solver.py board.txt RACK [--top 15] [--defend N] [--cap 5] [--no-swap]
+Usage: python3 crossplay_solver.py board.txt RACK [--top 15] [--defend N] [--cap N] [--no-swap]
 
 board.txt: 15 lines of 15 chars. '.' = empty, UPPERCASE = tile, lowercase = blank tile.
 RACK: your letters, '?' for a blank. The NWL2023 word list is downloaded from GitHub if missing.
 
 Moves rank by value = score + leave value (0 once the bag is empty). --defend N estimates the
 opponent's reply to the top N moves (exact once 7 or fewer tiles are unseen; otherwise replies of
-up to --cap tiles (4/5/7 by bag size) plus 7-tile sweeps onto an empty 2W/3W, averaged over sampled racks) and ranks
-by equity = value - expected reply - turn cost. Turn cost: a move that leaves the bag non-empty is
+up to --cap tiles, 4/5/7 by bag size, plus 7-tile sweeps onto an empty 2W/3W, averaged over
+sampled racks) and ranks by equity = value - expected reply - turn cost. Turn cost: a move that leaves the bag non-empty is
 charged (chance they empty it) x (expected reply), since the bag-emptier gets the last turn.
 Swaps (bag >= --swap-min) are 0-point moves valued at the leave kept.
 """
