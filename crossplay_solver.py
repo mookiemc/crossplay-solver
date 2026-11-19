@@ -2,6 +2,7 @@
 """NYT Crossplay move finder.
 
 Usage: python3 crossplay_solver.py board.txt RACK [--top 15] [--defend N] [--cap N] [--no-swap]
+                                   [--last-move]
 
 board.txt: 15 lines of 15 chars. '.' = empty, UPPERCASE = tile, lowercase = blank tile.
 RACK: your letters, '?' for a blank. The NWL2023 word list is downloaded from GitHub if missing.
@@ -12,6 +13,9 @@ up to --cap tiles, 4/5/7 by bag size, plus 7-tile sweeps onto an empty 2W/3W, av
 sampled racks) and ranks by equity = value - expected reply - turn cost. Turn cost: a move that leaves the bag non-empty is
 charged (chance they empty it) x (expected reply), since the bag-emptier gets the last turn.
 Swaps (bag >= --swap-min) are 0-point moves valued at the leave kept.
+A sampled opponent rack that holds a blank may use it as any letter (scored 0), on the square where
+that costs least. --last-move: the bag is empty and this play ends the game (you emptied the bag and
+the opponent has had their final turn), so moves rank by score alone and no reply is checked.
 """
 import argparse
 from collections import Counter
@@ -137,22 +141,31 @@ def get_trie(words, cache_path=None):
     return t
 
 
+LMUL = {"3L": 3, "2L": 2}
+WMUL = {"3W": 3, "2W": 2}
+
+
 def make_solve(S, cache_path=None):
     """Trie + anchors + cross-check sets move generator (Appel-Jacobson style)."""
-    N, PREM, tile_score, SWEEP_BONUS = S.N, S.PREM, S.tile_score, S.SWEEP_BONUS
-    LM = {"3L": 3, "2L": 2}
-    WM = {"3W": 3, "2W": 2}
+    N, PREM, tile_score, SWEEP_BONUS, VALUES = S.N, S.PREM, S.tile_score, S.SWEEP_BONUS, S.VALUES
+    LM, WM = S.LMUL, S.WMUL
 
-    def solve(board, rack, words, max_tiles=7):
+    def solve(board, rack, words, max_tiles=7, sink=None):
+        """Every legal move, best score first. A blank goes on the square where it costs least, and
+        a one-tile play that forms a word both ways is listed once.
+        With `sink`, no list is built: each move goes to sink(score, real, blanks, ref), where real
+        is [(letter, points that tile adds to the score)] for the non-blank tiles (see reply_model)."""
         allwords = getattr(words, "allwords", words)
         trie = get_trie(allwords, cache_path or TRIE_CACHE)
         rack_up = rack.upper()
         rack_full = Counter(rack_up)
         rc = Counter(rack_up)
         nblank = [rc.pop("?", 0)]
+        nblank0 = nblank[0]
         rc0 = Counter(rc)  # untouched copy: the search below mutates rc
         empty_board = all(ch == "." for row in board for ch in row)
         moves = []
+        singles = set()  # one-tile plays already recorded: (square, letter)
 
         for horiz in (True, False):
             B = board if horiz else [list(col) for col in zip(*board)]
@@ -185,42 +198,62 @@ def make_solve(S, cache_path=None):
                         anchor[c] = True
                     if empty_board and orig(r, c) == (7, 7):
                         anchor[c] = True
+                if not any(anchor):
+                    continue
+                prem = [PREM[orig(r, c)[0]][orig(r, c)[1]] for c in range(N)]
+                lmrow = [LM.get(p, 1) for p in prem]
+                wmrow = [WM.get(p, 1) for p in prem]
+                pre = [0]  # running total of the points of tiles already in this line
+                for c in range(N):
+                    pre.append(pre[-1] + (tile_score(row[c]) if row[c] != "." else 0))
 
                 def record(start, end, placed):
                     # placed: list of (col, letter) in left-to-right order
-                    need = Counter(ch for _, ch in placed)
-                    blank_left = {ch: max(0, n - rc0[ch]) for ch, n in need.items()}
-                    tiles = []
+                    k = len(placed)
+                    if k == 1:
+                        one = (orig(r, placed[0][0]), placed[0][1])
+                        if one in singles:
+                            return
+                        singles.add(one)
+                    wm = 1
+                    for c, _ in placed:
+                        wm *= wmrow[c]
+                    base, cross_pts, adds = pre[end + 1] - pre[start], 0, []
                     for c, ch in placed:
-                        if blank_left[ch] > 0:
-                            blank_left[ch] -= 1
-                            tiles.append((c, ch.lower()))
-                        else:
-                            tiles.append((c, ch))
-                    newmap = dict(tiles)
-                    letters, base, wm = [], 0, 1
-                    for c in range(start, end + 1):
-                        if c in newmap:
-                            ch = newmap[c]
-                            p = PREM[orig(r, c)[0]][orig(r, c)[1]]
-                            wm *= WM.get(p, 1)
-                            base += tile_score(ch) * LM.get(p, 1)
-                            letters.append(ch.upper())
-                        else:
-                            letters.append(row[c].upper())
-                            base += tile_score(row[c])
-                    main = base * wm
-                    total, formed = main, []
-                    for c, ch in tiles:
+                        v = VALUES[ch] * lmrow[c]
+                        base += v
                         x = cross[c]
                         if x is None:
-                            continue
-                        p = PREM[orig(r, c)[0]][orig(r, c)[1]]
-                        sc = (x[1] + tile_score(ch) * LM.get(p, 1)) * WM.get(p, 1)
-                        formed.append((x[2] + ch.upper() + x[3], sc))
-                        total += sc
-                    if len(tiles) == 7:
-                        total += SWEEP_BONUS
+                            adds.append(v * wm)  # what this tile's own points add to the score
+                        else:
+                            cross_pts += (x[1] + v) * wmrow[c]
+                            adds.append(v * (wm + wmrow[c]))
+                    total = base * wm + cross_pts + (SWEEP_BONUS if k == 7 else 0)
+                    blank_at = ()
+                    if nblank[0] < nblank0:  # blanks stand in for the copies of a letter that add least
+                        need = Counter(ch for _, ch in placed)
+                        blank_at = set()
+                        for ch, n in need.items():
+                            if n > rc0[ch]:
+                                spots = sorted((adds[i], i) for i in range(k) if placed[i][1] == ch)
+                                blank_at.update(i for _, i in spots[:n - rc0[ch]])
+                        total -= sum(adds[i] for i in blank_at)
+                    if sink is not None:
+                        sink(total, [(placed[i][1], adds[i]) for i in range(k) if i not in blank_at],
+                             len(blank_at), (horiz, r, start, end, tuple(placed)))
+                        return
+                    tiles = [(c, ch.lower() if i in blank_at else ch)
+                             for i, (c, ch) in enumerate(placed)]
+                    newmap = dict(tiles)
+                    letters = [newmap[c].upper() if c in newmap else row[c].upper()
+                               for c in range(start, end + 1)]
+                    formed = []
+                    for c, ch in tiles:
+                        x = cross[c]
+                        if x is not None:
+                            formed.append((x[2] + ch.upper() + x[3],
+                                           (x[1] + tile_score(ch) * lmrow[c]) * wmrow[c]))
+                    main = total - sum(sc for _, sc in formed) - (SWEEP_BONUS if k == 7 else 0)
                     used = Counter(ch if ch.isupper() else "?" for _, ch in tiles)
                     leave = rack_full - used
                     rs, cs = orig(r, start)
@@ -435,35 +468,191 @@ def premium_sweeps(board, pool, words, tiles_needed=7):
                     need = Counter(w[j - s] for j in empties)
                     if sum(max(0, n - pool_c[ch]) for ch, n in need.items()) > blanks:
                         continue
-                    short = Counter({ch: max(0, n - pool_c[ch]) for ch, n in need.items()})
-                    tiles = {}
+                    wm = 1
                     for j in empties:
-                        ch = w[j - s]
-                        if short[ch] > 0:
-                            short[ch] -= 1
-                            ch = ch.lower()
-                        tiles[pos[j]] = ch
-                    total, formed, base, wm = 0, [], 0, 1
-                    for (r, c), ch in tiles.items():
+                        wm *= WMUL.get(PREM[pos[j][0]][pos[j][1]], 1)
+                    adds = {}  # square -> what a real tile's own points add to the score there
+                    for j in empties:
+                        r, c = pos[j]
+                        p = PREM[r][c]
+                        crossed = allowed(r, c, horiz) is not None
+                        adds[j] = (VALUES[w[j - s]] * LMUL.get(p, 1)
+                                   * (wm + (WMUL.get(p, 1) if crossed else 0)))
+                    blank_at = set()  # blanks stand in for the copies that add least
+                    for ch, n in need.items():
+                        if n > pool_c[ch]:
+                            spots = sorted((adds[j], j) for j in empties if w[j - s] == ch)
+                            blank_at.update(j for _, j in spots[:n - pool_c[ch]])
+                    tiles = {pos[j]: w[j - s].lower() if j in blank_at else w[j - s]
+                             for j in empties}
+                    total, formed, base, by_letter = 0, [], 0, {}
+                    for j in range(s, e + 1):
+                        r, c = pos[j]
+                        if (r, c) not in tiles:
+                            base += tile_score(board[r][c])
+                            continue
+                        ch = tiles[(r, c)]
+                        base += tile_score(ch) * LMUL.get(PREM[r][c], 1)
                         cw = cross_word(board, r, c, ch, horiz)
                         if cw:
                             formed.append(cw)
                             total += cw[1]
-                    for j in range(s, e + 1):
-                        r, c = pos[j]
-                        if (r, c) in tiles:
-                            p = PREM[r][c]
-                            lm = 3 if p == "3L" else 2 if p == "2L" else 1
-                            wm *= 3 if p == "3W" else 2 if p == "2W" else 1
-                            base += tile_score(tiles[(r, c)]) * lm
-                        else:
-                            base += tile_score(board[r][c])
+                        if j not in blank_at:
+                            by_letter.setdefault(ch, []).append(adds[j])
                     total += base * wm + SWEEP_BONUS
+                    cost = {}  # letter -> cost of playing 1, 2, .. of its copies as blanks
+                    for ch, xs in by_letter.items():
+                        xs.sort()
+                        cost[ch] = [sum(xs[:i + 1]) for i in range(len(xs))]
                     rs, cs = pos[s]
                     moves.append(dict(word=w, row=rs + 1, col=cs + 1, tiles=tiles,
                                       dir="across" if horiz else "down", score=total,
-                                      main=base * wm, cross=formed, leave=""))
+                                      main=base * wm, cross=formed, leave="", blank_cost=cost))
     return moves
+
+
+def _reply_move(board, score, ref):
+    """A printable move for a reply kept by reply_model."""
+    horiz, r, start, end, placed = ref
+    new = dict(placed)
+    line = board[r] if horiz else [board[i][r] for i in range(N)]
+    word = "".join(new[c] if c in new else line[c].upper() for c in range(start, end + 1))
+    rs, cs = (r, start) if horiz else (start, r)
+    return dict(word=word, row=rs + 1, col=cs + 1, dir="across" if horiz else "down", score=score,
+                tiles={((r, c) if horiz else (c, r)): ch for c, ch in placed})
+
+
+def reply_model(board, unseen, words, cap, bag_after=0):
+    """The opponent's replies on `board` when their rack is 7 of the (more than 7) unseen tiles.
+    Lists every reply of up to `cap` tiles the unseen tiles allow, plus 7-tile sweeps onto an empty
+    2W/3W. Returns (reply, worst, sweeps): reply(rack) gives, for a Counter rack, (best score, the
+    sweep if their best reply is one, whether they can empty a bag of `bag_after`); worst is their
+    best reply with any rack. A blank in the rack plays as any letter, scores 0, and goes where that
+    costs least."""
+    from itertools import combinations_with_replacement
+    from operator import itemgetter
+    pool = "".join(unseen.elements())
+    pool_blanks = unseen.get("?", 0)
+    best = {}  # (blanks used, sorted real letters) -> (score, ref): the top reply per set of tiles
+    raw = []   # every reply, as [score, blanks used, real tiles, parsed]: for racks holding a blank
+
+    def sink(score, real, blanks, ref):
+        k = (blanks, tuple(sorted([ch for ch, _ in real])))
+        if k not in best or score > best[k][0]:
+            best[k] = (score, ref)
+        if pool_blanks:
+            raw.append([score, blanks, real, None])
+
+    solve(board, pool, words, max_tiles=cap, sink=sink)
+    threats = sorted(((sc, tuple(Counter(k[1]).items()), len(k[1]))
+                      for k, (sc, _ref) in best.items() if k[0] == 0),
+                     key=itemgetter(0), reverse=True)
+    raw.sort(key=itemgetter(0), reverse=True)
+    emptiers = [need for _sc, need, n in threats if n >= bag_after] if bag_after else []
+    raw_emptiers = [m for m in raw if m[1] + len(m[2]) >= bag_after] if bag_after else []
+
+    def parsed(m):
+        """[(letter, copies needed, cost of playing 1, 2, .. of them as blanks)], built on first use."""
+        if m[3] is None:
+            groups = {}
+            for ch, add in m[2]:
+                groups.setdefault(ch, []).append(add)
+            m[3] = []
+            for ch, xs in groups.items():
+                xs.sort()
+                m[3].append((ch, len(xs), [sum(xs[:i + 1]) for i in range(len(xs))]))
+        return m[3]
+
+    def with_blanks(rack, b, floor):
+        """Best reply for a rack with b blanks, each covering a letter the rack lacks."""
+        top = floor
+        for m in raw:
+            if m[0] <= top:
+                break
+            short = m[1]
+            if short > b:
+                continue
+            cost = 0
+            for ch, n, costs in m[3] or parsed(m):
+                d = n - rack[ch]
+                if d > 0:
+                    short += d
+                    if short > b:
+                        break
+                    cost += costs[d - 1]
+            else:
+                if m[0] - cost > top:
+                    top = m[0] - cost
+        return top
+
+    def can_empty_with_blanks(rack, b):
+        for m in raw_emptiers:
+            short = m[1]
+            if short > b:
+                continue
+            for ch, n, _costs in m[3] or parsed(m):
+                if n > rack[ch]:
+                    short += n - rack[ch]
+                    if short > b:
+                        break
+            else:
+                return True
+        return False
+
+    sweeps = premium_sweeps(board, pool, words)
+    sweeps_by_rack = {}
+    for m in sweeps:
+        key = tuple(sorted(ch if ch.isupper() else "?" for ch in m["tiles"].values()))
+        sweeps_by_rack.setdefault(key, []).append(m)
+    for ms in sweeps_by_rack.values():
+        ms.sort(key=lambda m: -m["score"])
+
+    def sweep_for(fixed, b):
+        """Best premium sweep for a rack (a sweep uses the whole rack, so look it up by rack)."""
+        if not sweeps:
+            return 0, None
+        if b == 0:
+            ms = sweeps_by_rack.get(tuple(fixed))
+            return (ms[0]["score"], ms[0]) if ms else (0, None)
+        top, pick = 0, None
+        for sub in combinations_with_replacement("ABCDEFGHIJKLMNOPQRSTUVWXYZ?", b):
+            for m in sweeps_by_rack.get(tuple(sorted(fixed + list(sub))), ()):
+                if m["score"] <= top:
+                    break
+                sc = m["score"] - sum(m["blank_cost"][ch][sub.count(ch) - 1]
+                                      for ch in set(sub) if ch != "?")
+                if sc > top:
+                    top, pick = sc, m
+        return top, pick
+
+    def reply(rack):
+        b = rack["?"]
+        sw_score, sw = sweep_for(sorted(ch for ch in rack.elements() if ch != "?"), b)
+        top = 0
+        for sc, need, _n in threats:
+            if sc <= sw_score:
+                break
+            if all(rack[ch] >= n for ch, n in need):
+                top = sc
+                break
+        if b:
+            top = with_blanks(rack, b, max(top, sw_score))
+        can_empty = bool(bag_after) and (
+            (sw is not None and bag_after <= 7)
+            or any(all(rack[ch] >= n for ch, n in need) for need in emptiers)
+            or (b > 0 and can_empty_with_blanks(rack, b)))
+        if sw is not None and sw_score >= top:
+            return sw_score, sw, can_empty
+        return top, None, can_empty
+
+    worst = None
+    if best:
+        sc, ref = max(best.values(), key=itemgetter(0))
+        worst = _reply_move(board, sc, ref)
+    for m in sweeps:
+        if worst is None or m["score"] > worst["score"]:
+            worst = m
+    return reply, worst, sweeps
 
 
 def expected_threat(board, unseen, words, samples=3000, seed=1, cap=2, bag_after=0):
@@ -471,72 +660,26 @@ def expected_threat(board, unseen, words, samples=3000, seed=1, cap=2, bag_after
     Returns (expected score, worst reply, chance of worst, exact?, chance they empty the bag,
     (example premium sweep, chance their best reply is one))."""
     import random
-    from itertools import combinations_with_replacement
     pool = "".join(unseen.elements())
     if len(pool) <= 7:
         m, _ = opponent_threat(board, unseen, words)
         return (m["score"] if m else 0), m, 1.0, True, 0.0, (None, 0.0)
-    moves = solve(board, pool, words, max_tiles=cap)
-    sweeps = premium_sweeps(board, pool, words)
-
-    def best_by_need(ms):
-        out = {}
-        for m in ms:
-            key = tuple(sorted(ch if ch.isupper() else "?" for ch in m["tiles"].values()))
-            if key not in out or m["score"] > out[key]["score"]:
-                out[key] = m
-        return out
-    threats = sorted(((m["score"], Counter(k), m) for k, m in best_by_need(moves).items()),
-                     key=lambda t: -t[0])
-    # a sweep uses the whole rack, so look it up by rack
-    sweep_by_rack = best_by_need(sweeps)
-    best_sweep = max(sweeps, key=lambda m: m["score"]) if sweeps else None
-    if not threats and not sweeps:
+    reply, worst, sweeps = reply_model(board, unseen, words, cap, bag_after)
+    if worst is None:
         return 0, None, 0.0, False, 0.0, (None, 0.0)
-    if best_sweep and (not threats or best_sweep["score"] > threats[0][0]):
-        worst = best_sweep
-    else:
-        worst = threats[0][2]
-
-    def sweep_for(rack):
-        letters = sorted(rack.elements())
-        nb = letters.count("?")
-        if nb == 0:
-            return sweep_by_rack.get(tuple(letters))
-        fixed = [ch for ch in letters if ch != "?"]
-        best = None
-        for sub in combinations_with_replacement("ABCDEFGHIJKLMNOPQRSTUVWXYZ?", nb):
-            m = sweep_by_rack.get(tuple(sorted(fixed + list(sub))))
-            if m and (best is None or m["score"] > best["score"]):
-                best = m
-        return best
-
-    emptiers = [need for _sc, need, _m in threats if sum(need.values()) >= bag_after]
     rng = random.Random(seed)
     tiles = list(pool)
     total, worst_hits, empties, sweep_hits, seen = 0, 0, 0, 0, Counter()
     for _ in range(samples):
-        rack = Counter(rng.sample(tiles, 7))
-        sw = sweep_for(rack) if sweeps else None
-        best = None
-        for sc, need, m in threats:
-            if sw and sc <= sw["score"]:
-                break
-            if all(rack[ch] >= n for ch, n in need.items()):
-                best = m
-                break
-        if sw and (best is None or sw["score"] > best["score"]):
-            best = sw
+        score, sw, can_empty = reply(Counter(rng.sample(tiles, 7)))
+        total += score
+        worst_hits += (score == worst["score"])
+        empties += can_empty
+        if sw:
             sweep_hits += 1
             seen[(sw["word"], sw["row"], sw["col"], sw["dir"])] += 1
-        if best:
-            total += best["score"]
-            worst_hits += (best is worst)
-        if bag_after and ((sw and bag_after <= 7) or any(all(rack[ch] >= n for ch, n in need.items())
-                                    for need in emptiers)):
-            empties += 1
     p_empty = empties / samples if bag_after else 0.0
-    example = best_sweep
+    example = max(sweeps, key=lambda m: m["score"]) if sweeps else None
     if seen:
         k = seen.most_common(1)[0][0]
         example = next(m for m in sweeps if (m["word"], m["row"], m["col"], m["dir"]) == k)
@@ -593,6 +736,9 @@ def main():
     ap.add_argument("--cap", type=int, default=None,
                     help="most tiles in an opponent reply the defense check lists (default by "
                          "bag: 4 if over 40, 5 if 21-40, 7 = every reply if 20 or fewer)")
+    ap.add_argument("--last-move", action="store_true",
+                    help="the bag is empty and this play ends the game (you emptied the bag and the "
+                         "opponent has had their final turn): rank by score alone, check no reply")
     a = ap.parse_args()
     global TRIE_CACHE
     TRIE_CACHE = a.words + ".trie.pkl"
@@ -606,6 +752,14 @@ def main():
     print(f"unseen {n} (bag {bag}, opponent rack {min(7, n)}): "
           + " ".join(k * v for k, v in sorted(unseen.items())))
     moves = solve(board, a.rack, words)
+    if a.last_move and bag > 0:
+        print(f"ignoring --last-move: the bag still holds {bag}")
+        a.last_move = False
+    if a.last_move:
+        print("last move of the game: ranked by score, no reply to check")
+        for m in moves[:a.top]:
+            print(fmt(m))
+        return
     for m in moves:
         m["lv"] = leave_value(m["leave"], bag)
         m["val"] = m["score"] + m["lv"]
@@ -627,6 +781,9 @@ def main():
             pool += [m for m in moves if len(m["tiles"]) >= bag and m not in pool][:3]
         print(f"\ndefense check, {len(pool)} moves, replies up to {a.cap} tiles: "
               "equity = score + leave value - expected reply - turn cost")
+        if bag == 0:
+            print("bag is empty: this assumes the opponent still has a final turn. If this play "
+                  "ends the game, rerun with --last-move.")
         rows = []
         cache = None  # every swap leaves the board unchanged, so its reply is computed once
         for m in pool:
