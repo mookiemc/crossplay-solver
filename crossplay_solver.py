@@ -2,7 +2,7 @@
 """NYT Crossplay move finder.
 
 Usage: python3 crossplay_solver.py board.txt RACK [--top 15] [--defend N] [--cap N] [--no-swap]
-                                   [--final N] [--last-move]
+                                   [--final N] [--last-move] [--lookahead N]
 
 board.txt: 15 lines of 15 chars. '.' = empty, UPPERCASE = tile, lowercase = blank tile.
 RACK: your letters, '?' for a blank. The NWL2023 word list is downloaded from GitHub if missing.
@@ -22,6 +22,12 @@ Swaps (bag >= --swap-min) are 0-point moves valued at the leave kept.
 A sampled opponent rack that holds a blank may use it as any letter (scored 0), on the square where
 that costs least. --last-move: the bag is empty and this play ends the game (you emptied the bag and
 the opponent has had their final turn), so moves rank by score alone and no reply is checked.
+--lookahead N (bag of 8 or more): after the defense check, play each checked move three turns deep
+over N deals: the opponent gets 7 unseen tiles and makes their top-scoring reply, I draw my
+replacement tiles and make my top-scoring next play. Moves are listed by net = score - their reply
++ my next play - turn cost. The same deals are used for every move, and each line shows how far it
+is behind the top move with the standard error of that gap. This is the only part of the solver
+that looks at my own next turn; the leave value is not used in it.
 """
 import argparse
 from collections import Counter
@@ -736,6 +742,54 @@ def final_play(board, leave, unseen, words, limit=80, seed=1):
     return round(mine / total, 1), round(theirs / total, 1), exact, len(ways) if exact else limit
 
 
+def _on_premium(m):
+    return bool(m) and any(PREM[r][c] in WMUL for (r, c) in m["tiles"])
+
+
+def lookahead(board, moves, unseen, words, bag, deals=100, seed=1):
+    """Three turns for each move: my move, their top-scoring reply, my top-scoring next play.
+    Each deal gives the opponent 7 unseen tiles and me the next tiles of the same shuffle as my
+    draw (as many as the move places or swaps), so every move meets the same deals and the gap
+    between two moves is steadier than either number alone.
+    Returns one dict per move: reply and next (averages), reply_prem and next_prem (share of deals
+    where that play covers a 2W/3W), and nets (my next minus their reply, per deal)."""
+    import random
+    rng = random.Random(seed)
+    tiles = sorted(unseen.elements())
+    shuffles = []
+    for _ in range(deals):
+        p = tiles[:]
+        rng.shuffle(p)
+        shuffles.append(p)
+    out = []
+    replies = {}  # for moves that leave the board unchanged (swaps): their reply per deal
+    for m in moves:
+        k = min(len(m["swap"]) if "swap" in m else len(m["tiles"]), bag)
+        b1 = apply_move(board, m)
+        r_tot = n_tot = r_prem = n_prem = 0
+        nets = []
+        for i, p in enumerate(shuffles):
+            if m["tiles"] or i not in replies:
+                reply = solve(b1, "".join(p[:7]), words, best=True)
+                r = reply[0] if reply else None
+                if not m["tiles"]:
+                    replies[i] = r
+            else:
+                r = replies[i]
+            nxt = solve(apply_move(b1, r) if r else b1, m["leave"] + "".join(p[7:7 + k]), words,
+                        best=True)
+            n = nxt[0] if nxt else None
+            rs, ns = (r["score"] if r else 0), (n["score"] if n else 0)
+            r_tot += rs
+            n_tot += ns
+            r_prem += _on_premium(r)
+            n_prem += _on_premium(n)
+            nets.append(ns - rs)
+        out.append(dict(reply=r_tot / deals, next=n_tot / deals, reply_prem=r_prem / deals,
+                        next_prem=n_prem / deals, nets=nets))
+    return out
+
+
 def swap_moves(rack, bag, best=3):
     """The `best` swaps by leave value of the tiles kept."""
     from itertools import combinations
@@ -792,7 +846,13 @@ def main():
     ap.add_argument("--last-move", action="store_true",
                     help="the bag is empty and this play ends the game (you emptied the bag and the "
                          "opponent has had their final turn): rank by score alone, check no reply")
+    ap.add_argument("--lookahead", type=int, default=0,
+                    help="after the defense check, play each checked move three turns deep over N "
+                         "deals (their top reply, then my top next play) and list by net; needs a "
+                         "bag of 8 or more; turns on --defend 4 if --defend is not given")
     a = ap.parse_args()
+    if a.lookahead > 0 and not a.defend and not a.last_move:
+        a.defend = 4
     global TRIE_CACHE
     TRIE_CACHE = a.words + ".trie.pkl"
     words = load_words(a.words)
@@ -895,6 +955,34 @@ def main():
                   f"leave {m['leave'] or '-':<7} ({fin[1] if fin else m['lv']:+.1f}) | "
                   f"{'exact reply' if exact else 'expected reply'} {exp:.1f}{turns} | "
                   f"worst: {wt}{sw}")
+        if a.lookahead > 0 and bag <= 7:
+            print(f"\nlookahead skipped: with the bag at {bag}, the check above already plays the "
+                  "last turns out")
+        elif a.lookahead > 0:
+            n = a.lookahead
+            look = lookahead(board, [row[2] for row in rows], unseen, words, bag, n)
+            table = []
+            for row, lk in zip(rows, look):
+                m, cost = row[2], row[8]
+                nets = [m["score"] + x - cost for x in lk["nets"]]
+                table.append((sum(nets) / n, m, lk, nets, cost))
+            table.sort(key=lambda t: -t[0])
+            top_nets = table[0][3]
+            print(f"\nlookahead, {n} deals (the same deals for every move): net = score - their top "
+                  "reply + my top next play - turn cost")
+            for net, m, lk, nets, cost in table:
+                if nets is top_nets:
+                    gap = "top"
+                else:
+                    d = [x - y for x, y in zip(top_nets, nets)]
+                    mean = sum(d) / n
+                    se = (sum((x - mean) ** 2 for x in d) / max(1, n - 1) / n) ** 0.5
+                    gap = f"behind top by {mean:.1f} +/- {se:.1f}"
+                tc = f" | turn cost {cost:.1f}" if cost else ""
+                print(f"net {net:6.1f}  {m['word']:<10} {m['score']:3d} {where(m)} "
+                      f"leave {m['leave'] or '-':<7} | their reply {lk['reply']:.1f} "
+                      f"(on 2W/3W {lk['reply_prem']:.0%}) | my next {lk['next']:.1f} "
+                      f"(on 2W/3W {lk['next_prem']:.0%}){tc} | {gap}")
 
 
 if __name__ == "__main__":
