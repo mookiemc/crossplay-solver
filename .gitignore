@@ -1,0 +1,4 @@
+NWL2023.txt
+*.trie.pkl
+__pycache__/
+board.txt
